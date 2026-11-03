@@ -1,0 +1,10 @@
+path: /content/drive/MyDrive/dataset_hole/dataset_HRP4k/HRP4K_YOLO
+
+train: images/train
+val: images/valid
+test: images/test
+
+nc: 1
+
+names:
+  0: pothole
