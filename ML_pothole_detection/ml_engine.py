@@ -1,6 +1,3 @@
-import cv2 as cv
-import numpy as np
-
 #TODO:
 """
 1. tentukan lokasi model (format onnyx masih plan)
@@ -21,58 +18,102 @@ import numpy as np
 15. tampung 3 feature itu di detection dictionary
 """
 
-class Ml_Engine():
-    def __init__(self, model=None, conf_thresh=0.7, nms_thresh=0.4):
-        self.model=cv.dnn.readNetFromONNX(model) if model is not None else print("model path not defined")
-        self.conf_thresh=conf_thresh
-        self.nms_thresh=nms_thresh
-    def pred(self,frame):
-        h_real,w_real,_=frame.shape
-        x_fact,y_fact=w_real/640,h_real/640
+import cv2 as cv
+import numpy as np
+import supervision as sv
+import onnxruntime as ort
+from trackers import ByteTrackTracker
+
+class Ml_Engine:
+    def __init__(self, model=None, conf_thresh=0.7, nms_thresh=0.4, track_activation: float = 0.25, minimum_consecutive_frames: int = 1):
+        if model is None:
+            raise ValueError("Model path must be defined")
         
-        # pastiin atur ulang karena kamera mempunya beberapa parameter yang berbeda contohnya resolusi
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        self.session = ort.InferenceSession(model, providers=providers)
+        
+        self.input_name = self.session.get_inputs()[0].name
+        self.input_type = self.session.get_inputs()[0].type
+        self.output_names = [out.name for out in self.session.get_outputs()]
+        
+        self.conf_thresh = conf_thresh
+        self.nms_thresh = nms_thresh
+        self.tracker = ByteTrackTracker(
+            track_activation_threshold=track_activation,
+            minimum_consecutive_frames=minimum_consecutive_frames
+        )
+
+    def pred(self, frame) -> list[dict]:
+        h_real, w_real, _ = frame.shape
+        x_fact, y_fact = w_real / 640.0, h_real / 640.0
+        
         blob = cv.dnn.blobFromImage(frame, scalefactor=1/255.0, size=(640, 640), swapRB=True, crop=False)
-    
-        self.model.setInput(blob)
-        output_layers = self.model.getUnconnectedOutLayersNames()
+        if 'float16' in self.input_type:
+            blob = blob.astype(np.float16)
+
+        outputs = self.session.run(self.output_names, {self.input_name: blob})
+        output = np.squeeze(outputs[0]).astype(np.float32)
         
-        #forward layer
-        pred=self.model.forward(output_layers) #[batch,baris(x,y,w,h,conf,...),kolom(nilai dari x,y,w,h,conf,...)]
-        pred=np.squeeze(pred).T #expected [batch,baris,kolom,conf...] -> [baris,kolom,conf] -> T = [kolom,baris] 
-        
-        #prediction result
-        boxes=[]
-        conf=[]
-        cls_id=[]
-        
-        for row in pred:
-            if conf>self.conf_thresh: # -> bool
-                cx,cy,w_img,h_img=row[0:4] # -> cx=koor_x,cy=koor_y,w=witdh,h=height 
-                left = int((cx - 0.5 * w_img) * x_fact)
-                top = int((cy - 0.5 * h_img) * y_fact)
-                width = int(w_img * x_fact)
-                height = int(h_img * y_fact)
-        
-                boxes.append([left,top,width,height]) # -> [left,top,width,height]
-                conf.append(row[4]) # -> [conf]
-                cls_id.append(row[4]) #[conf1, conf2, ....]
-            indices=cv.dnn.NMSBoxes(boxes, conf, self.conf_threshold, self.nms_thresh) # ga numpuk
-        
-            detections = []
+        if output.shape[0] < output.shape[1]:
+            output = output.T  # (8400, 5)
+
+        scores = np.max(output[:, 4:], axis=1)
+        mask = scores > self.conf_thresh
+        valid_preds = output[mask]
+
+        # Default deteksi kosong (tetap wajib masuk tracker.update agar state waktu tracker jalan)
+        sv_detections = sv.Detections.empty()
+
+        if len(valid_preds) > 0:
+            valid_scores = scores[mask]
+            valid_cls_ids = np.argmax(valid_preds[:, 4:], axis=1)
+
+            cx, cy, w_img, h_img = valid_preds[:, 0], valid_preds[:, 1], valid_preds[:, 2], valid_preds[:, 3]
+            
+            # Clipping koordinat agar tidak keluar batas resolusi gambar
+            x1 = np.clip((cx - 0.5 * w_img) * x_fact, 0, w_real)
+            y1 = np.clip((cy - 0.5 * h_img) * y_fact, 0, h_real)
+            x2 = np.clip((cx + 0.5 * w_img) * x_fact, 0, w_real)
+            y2 = np.clip((cy + 0.5 * h_img) * y_fact, 0, h_real)
+            width = x2 - x1
+            height = y2 - y1
+
+            # 1. Format [x1, y1, width, height] khusus untuk OpenCV NMSBoxes
+            boxes_xywh = np.column_stack((x1, y1, width, height)).tolist()
+            # 2. Format [x1, y1, x2, y2] khusus untuk Supervision & Output
+            boxes_xyxy = np.column_stack((x1, y1, x2, y2)).astype(np.float32)
+
+            indices = cv.dnn.NMSBoxes(boxes_xywh, valid_scores.tolist(), self.conf_thresh, self.nms_thresh)
+
             if len(indices) > 0:
-                for i in indices.flatten():
-                    box = boxes[i]
-                    x1 = max(0, box[0])
-                    y1 = max(0, box[1])
-                    x2 = min(w_img, box[0] + box[2])
-                    y2 = min(h_img, box[1] + box[3])
-                    detections.append({
-                        "class_id": cls_id[i],
-                        "class_name": "pothole",
-                        "confidence": round(conf[i], 2),
-                        "x1": float(x1),
-                        "y1": float(y1),
-                        "x2": float(x2),
-                        "y2": float(y2)
-                    }) # -> {dict}
-            return detections
+                idx = indices.flatten()
+                sv_detections = sv.Detections(
+                    xyxy=boxes_xyxy[idx],
+                    confidence=valid_scores[idx].astype(np.float32),
+                    class_id=valid_cls_ids[idx].astype(int)
+                )
+
+        # Update tracker di setiap frame (baik ada deteksi maupun kosong)
+        tracked = self.tracker.update(sv_detections)
+
+        # Susun output akhir list[dict] lengkap dengan track_id
+        detections = []
+        if len(tracked) > 0:
+            for i in range(len(tracked)):
+                bx1, by1, bx2, by2 = tracked.xyxy[i].astype(int)
+                track_id = int(tracked.tracker_id[i]) if tracked.tracker_id is not None else -1
+                
+                detections.append({
+                    "track_id": track_id,
+                    "class_id": int(tracked.class_id[i]),
+                    "class_name": "pothole",
+                    "confidence": round(float(tracked.confidence[i]), 2),
+                    "x1": int(bx1),
+                    "y1": int(by1),
+                    "x2": int(bx2),
+                    "y2": int(by2),
+                    "w": int(bx2 - bx1),
+                    "h": int(by2 - by1)
+                })
+
+        return detections
