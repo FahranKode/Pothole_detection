@@ -1,46 +1,56 @@
-#pragma once
-#include <Arduino.h>
+#include "omniwheel.hpp" // Pastikan sama dengan nama file header
 
-class Motor {
-private:
-    uint8_t in1, in2;
+void Motor::init() {
+    pinMode(in1, OUTPUT);
+    pinMode(in2, OUTPUT);
+    stop();
+}
 
-public:
-    Motor(uint8_t in1, uint8_t in2) : in1(in1), in2(in2) {}
+void Motor::drive(int16_t speed) {
+    // Safety clamp agar tidak lewat batas PWM 8-bit
+    speed = constrain(speed, -255, 255);
 
-    void init();
-    // void forward(uint8_t speed);
-    // void backward(uint8_t speed);
-    void stop();
-    void drive(uint8_t speed);
-};
+    if (speed > 0) {
+        analogWrite(in1, speed);
+        digitalWrite(in2, LOW);
+    } else if (speed < 0) {
+        digitalWrite(in1, LOW);
+        analogWrite(in2, -speed);
+    } else {
+        stop(); // Eksplisit matikan kedua pin jika speed == 0
+    }
+}
 
-class MechanumWheel {
-private:
-    Motor frontLeft;
-    Motor frontRight;
-    Motor backLeft;
-    Motor backRight;
+void Motor::stop() {
+    digitalWrite(in1, LOW);
+    digitalWrite(in2, LOW);
+}
 
-public:
-    // Pass by const reference (&) lebih efisien daripada copy object
-    MechanumWheel(const Motor& fl, const Motor& fr, const Motor& bl, const Motor& br)
-        : frontLeft(fl), frontRight(fr), backLeft(bl), backRight(br) {}
+void MechanumWheel::stopAll() {
+    frontLeft.stop();
+    frontRight.stop();
+    backLeft.stop();
+    backRight.stop();
+}
 
-    void init() {
-        frontLeft.init();
-        frontRight.init();
-        backLeft.init();
-        backRight.init();
+void MechanumWheel::drive(int vx, int vy, int omega) {
+    float rawFL = vy + vx + omega;
+    float rawFR = vy - vx - omega;
+    float rawRL = vy - vx + omega;
+    float rawRR = vy + vx - omega;
+
+    // Gunakan fabs() untuk float dan simpan di float
+    float maxVal = max(fabs(rawFL), max(fabs(rawFR), max(fabs(rawRL), fabs(rawRR))));
+
+    if (maxVal > 255.0f) {
+        rawFL = (rawFL / maxVal) * 255.0f;
+        rawFR = (rawFR / maxVal) * 255.0f;
+        rawRL = (rawRL / maxVal) * 255.0f;
+        rawRR = (rawRR / maxVal) * 255.0f;
     }
 
-    void drive(int vx, int vy, int omega );
-
-    // void moveForward(uint8_t speed);
-    // void moveBackward(uint8_t speed);
-    // void strafeLeft(uint8_t speed);
-    // void strafeRight(uint8_t speed);
-    // void rotateLeft(uint8_t speed);
-    // void rotateRight(uint8_t speed);
-    void stopAll();
-};
+    frontLeft.drive((int16_t)rawFL);
+    frontRight.drive((int16_t)rawFR);
+    backLeft.drive((int16_t)rawRL);
+    backRight.drive((int16_t)rawRR);
+}
